@@ -1,0 +1,17 @@
+[package]
+name = "png_stream_dec"
+version = "0.1.0"
+edition = "2021"
+
+# We compile both as a static C-library (.a) and a standard rust lib (.rlib)
+[lib]
+name = "pngstreamdec"
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+name = "test_png_stream_dec"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.0"
+clap = { version = "4.4", features = ["derive"] }
