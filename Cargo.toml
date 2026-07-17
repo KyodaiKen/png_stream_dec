@@ -13,5 +13,5 @@ name = "test_png_stream_dec"
 path = "src/main.rs"
 
 [dependencies]
-flate2 = "1.0"
-clap = { version = "4.4", features = ["derive"] }
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
+clap = { version = "4.0", features = ["derive"] }

@@ -2,14 +2,14 @@ use flate2::{Decompress, FlushDecompress};
 use std::cmp;
 use std::ffi::CStr;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read};
 use std::os::raw::c_char;
 use std::ptr;
 
 const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
 pub struct PngDecoder {
-    reader: BufReader<File>,
+    reader: BufReader<Box<dyn Read>>,
     decompressor: Decompress,
     pub width: u32,
     pub height: u32,
@@ -23,7 +23,7 @@ pub struct PngDecoder {
 
     uncompressed_buffer: Vec<u8>,
     prev_scanline: Vec<u8>,
-    output_buffer: Vec<u8>,
+    pending_drain: usize, // Tracks bytes to remove on the next call to avoid re-allocating
 }
 
 #[repr(C)]
@@ -32,45 +32,112 @@ pub struct ScanlinesResult {
     pub size: usize,
 }
 
-fn unfilter_scanline(
+pub type PngReadCallback = extern "C" fn(user_data: *mut std::ffi::c_void, buf: *mut u8, len: usize) -> usize;
+
+struct FfiReader {
+    cb: PngReadCallback,
+    user_data: *mut std::ffi::c_void,
+}
+
+impl Read for FfiReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let bytes_read = (self.cb)(self.user_data, buf.as_mut_ptr(), buf.len());
+        Ok(bytes_read)
+    }
+}
+
+fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> Result<(), String> {
+    let mut take = reader.take(count);
+    std::io::copy(&mut take, &mut std::io::sink()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// Runs the filter logic strictly in-place with zero loop branching and zero modulo operations.
+fn unfilter_scanline_inplace(
     filter_type: u8,
     bpp: usize,
     bytes_per_scanline: usize,
-    prev_scanline: &[u8],
-    raw: &[u8],
-    out: &mut [u8],
+    prev_scanline: &mut [u8],
+    buffer: &mut [u8],
+    src_start: usize,
+    dest_start: usize,
 ) {
-    for i in 0..bytes_per_scanline {
-        let left = if i >= bpp { out[i - bpp] } else { 0 };
-        let up = prev_scanline[i];
-        let up_left = if i >= bpp { prev_scanline[i - bpp] } else { 0 };
-
-        let val = match filter_type {
-            0 => raw[i],
-            1 => raw[i].wrapping_add(left),
-            2 => raw[i].wrapping_add(up),
-            3 => {
-                let avg = ((left as u16 + up as u16) / 2) as u8;
-                raw[i].wrapping_add(avg)
+    match filter_type {
+        0 => {
+            // None: Direct copy/shift
+            for i in 0..bytes_per_scanline {
+                let val = buffer[src_start + i];
+                buffer[dest_start + i] = val;
+                prev_scanline[i] = val;
             }
-            4 => {
+        }
+        1 => {
+            // Sub: Depends only on 'left'
+            for i in 0..bytes_per_scanline {
+                let left = if i >= bpp { buffer[dest_start + i - bpp] } else { 0 };
+                let val = buffer[src_start + i].wrapping_add(left);
+                buffer[dest_start + i] = val;
+                prev_scanline[i] = val;
+            }
+        }
+        2 => {
+            // Up: Depends only on 'up'
+            for i in 0..bytes_per_scanline {
+                let up = prev_scanline[i];
+                let val = buffer[src_start + i].wrapping_add(up);
+                buffer[dest_start + i] = val;
+                prev_scanline[i] = val;
+            }
+        }
+        3 => {
+            // Average: Depends on 'left' and 'up'
+            for i in 0..bytes_per_scanline {
+                let left = if i >= bpp { buffer[dest_start + i - bpp] } else { 0 };
+                let up = prev_scanline[i];
+                let avg = ((left as u16 + up as u16) / 2) as u8;
+                let val = buffer[src_start + i].wrapping_add(avg);
+                buffer[dest_start + i] = val;
+                prev_scanline[i] = val;
+            }
+        }
+        4 => {
+            // Paeth: Depends on 'left', 'up', and 'up_left'
+            let mut up_left_buf = [0u8; 8];
+            let mut up_left_idx = 0;
+
+            for i in 0..bytes_per_scanline {
+                let left = if i >= bpp { buffer[dest_start + i - bpp] } else { 0 };
+                let up = prev_scanline[i];
+                let up_left = if i >= bpp { up_left_buf[up_left_idx] } else { 0 };
+
                 let p = left as i32 + up as i32 - up_left as i32;
                 let pa = (p - left as i32).abs();
                 let pb = (p - up as i32).abs();
                 let pc = (p - up_left as i32).abs();
+
                 let pr = if pa <= pb && pa <= pc { left } else if pb <= pc { up } else { up_left };
-                raw[i].wrapping_add(pr)
+                let val = buffer[src_start + i].wrapping_add(pr);
+
+                // Safe sliding pointer avoids expensive modulo (%) operations
+                if bpp > 0 {
+                    up_left_buf[up_left_idx] = up;
+                    up_left_idx += 1;
+                    if up_left_idx == bpp {
+                        up_left_idx = 0;
+                    }
+                }
+
+                buffer[dest_start + i] = val;
+                prev_scanline[i] = val;
             }
-            _ => raw[i],
-        };
-        out[i] = val;
+        }
+        _ => {}
     }
 }
 
 impl PngDecoder {
-    fn new(path: &str) -> Result<Self, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(file);
+    fn new(reader: Box<dyn Read>) -> Result<Self, String> {
+        let mut reader = BufReader::new(reader);
 
         let mut magic = [0u8; 8];
         reader.read_exact(&mut magic).map_err(|_| "Failed to read magic".to_string())?;
@@ -108,7 +175,7 @@ impl PngDecoder {
         let bytes_per_pixel = cmp::max(1, bits_per_pixel / 8);
         let bytes_per_scanline = (width as usize * bits_per_pixel + 7) / 8;
 
-        reader.seek(SeekFrom::Current(4)).unwrap();
+        skip_bytes(&mut reader, 4)?; // Skip IHDR CRC
 
         Ok(Self {
             reader,
@@ -123,11 +190,11 @@ impl PngDecoder {
            idat_remaining: 0,
            uncompressed_buffer: Vec::new(),
            prev_scanline: vec![0; bytes_per_scanline],
-           output_buffer: Vec::new(),
+           pending_drain: 0,
         })
     }
 
-    fn read_chunk_header(reader: &mut BufReader<File>) -> Result<(usize, [u8; 4]), String> {
+    fn read_chunk_header<R: Read>(reader: &mut R) -> Result<(usize, [u8; 4]), String> {
         let mut head = [0u8; 8];
         if reader.read_exact(&mut head).is_err() {
             return Err("EOF reached".to_string());
@@ -157,7 +224,35 @@ pub extern "C" fn open_png(
         Err(_) => return ptr::null_mut(),
     };
 
-    match PngDecoder::new(path) {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return ptr::null_mut(),
+    };
+
+    match PngDecoder::new(Box::new(file)) {
+        Ok(decoder) => unsafe {
+            if !width.is_null() { *width = decoder.width; }
+            if !height.is_null() { *height = decoder.height; }
+            if !bit_depth.is_null() { *bit_depth = decoder.bit_depth; }
+            if !color_type.is_null() { *color_type = decoder.color_type; }
+            Box::into_raw(Box::new(decoder))
+        },
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn open_png_stream(
+    read_cb: PngReadCallback,
+    user_data: *mut std::ffi::c_void,
+    width: *mut u32,
+    height: *mut u32,
+    bit_depth: *mut u8,
+    color_type: *mut u8,
+) -> *mut PngDecoder {
+    let reader = Box::new(FfiReader { cb: read_cb, user_data });
+
+    match PngDecoder::new(reader) {
         Ok(decoder) => unsafe {
             if !width.is_null() { *width = decoder.width; }
             if !height.is_null() { *height = decoder.height; }
@@ -175,7 +270,11 @@ pub extern "C" fn decode_scanlines(
     mut num_scanlines: u32,
 ) -> ScanlinesResult {
     let dec = unsafe { &mut *handle };
-    dec.output_buffer.clear();
+
+    if dec.pending_drain > 0 {
+        dec.uncompressed_buffer.drain(..dec.pending_drain);
+        dec.pending_drain = 0;
+    }
 
     if dec.current_y >= dec.height {
         return ScanlinesResult { data: ptr::null(), size: 0 };
@@ -194,7 +293,7 @@ pub extern "C" fn decode_scanlines(
     while dec.uncompressed_buffer.len() < total_bytes_needed {
         if dec.idat_remaining == 0 {
             if dec.current_y > 0 || !dec.uncompressed_buffer.is_empty() {
-                dec.reader.seek(SeekFrom::Current(4)).unwrap();
+                skip_bytes(&mut dec.reader, 4).unwrap();
             }
 
             loop {
@@ -206,7 +305,7 @@ pub extern "C" fn decode_scanlines(
                             dec.idat_remaining = len;
                             break;
                         } else {
-                            dec.reader.seek(SeekFrom::Current(len as i64 + 4)).unwrap();
+                            skip_bytes(&mut dec.reader, (len + 4) as u64).unwrap();
                         }
                     }
                     Err(_) => break,
@@ -244,41 +343,34 @@ pub extern "C" fn decode_scanlines(
         dec.uncompressed_buffer.len() / bytes_needed_per_line
     );
 
-    dec.output_buffer.resize(lines_to_process * dec.bytes_per_scanline, 0);
+    let bytes_per_scanline = dec.bytes_per_scanline;
+    let bpp = dec.bytes_per_pixel;
+    let uncompressed = &mut dec.uncompressed_buffer;
+    let prev = &mut dec.prev_scanline;
 
-    {
-        let bytes_per_scanline = dec.bytes_per_scanline;
-        let bpp = dec.bytes_per_pixel;
-        let uncompressed = &dec.uncompressed_buffer;
-        let output = &mut dec.output_buffer;
-        let prev = &mut dec.prev_scanline;
+    for i in 0..lines_to_process {
+        let src_start = i * bytes_needed_per_line;
+        let filter_type = uncompressed[src_start];
 
-        for i in 0..lines_to_process {
-            let start = i * bytes_needed_per_line;
-            let filter_type = uncompressed[start];
-            let raw_scanline = &uncompressed[start + 1 .. start + bytes_needed_per_line];
+        let dest_start = i * bytes_per_scanline;
 
-            let out_start = i * bytes_per_scanline;
-            let out_slice = &mut output[out_start .. out_start + bytes_per_scanline];
-
-            unfilter_scanline(
-                filter_type,
-                bpp,
-                bytes_per_scanline,
-                prev,
-                raw_scanline,
-                out_slice,
-            );
-            prev.copy_from_slice(out_slice);
-        }
+        unfilter_scanline_inplace(
+            filter_type,
+            bpp,
+            bytes_per_scanline,
+            prev,
+            uncompressed,
+            src_start + 1,
+            dest_start,
+        );
     }
 
-    dec.uncompressed_buffer.drain(..lines_to_process * bytes_needed_per_line);
+    dec.pending_drain = lines_to_process * bytes_needed_per_line;
     dec.current_y += lines_to_process as u32;
 
     ScanlinesResult {
-        data: dec.output_buffer.as_ptr(),
-        size: dec.output_buffer.len(),
+        data: dec.uncompressed_buffer.as_ptr(),
+        size: lines_to_process * dec.bytes_per_scanline,
     }
 }
 

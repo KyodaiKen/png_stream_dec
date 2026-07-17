@@ -1,10 +1,9 @@
 use clap::Parser;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 
-// By importing from the crate module path, Cargo cleanly links the binary with our local library.
-use pngstreamdec::{open_png, decode_scanlines, close_png};
+use pngstreamdec::{open_png, open_png_stream, decode_scanlines, close_png};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Stream PNG to PPM")]
@@ -15,11 +14,17 @@ struct Args {
     #[arg(short = 's', long, help = "Num scanlines per block (mutually exclusive with -m)")]
     scanlines: Option<u32>,
 
-    #[arg(help = "Input PNG file")]
+    #[arg(help = "Input PNG file (use '-' for stdin)")]
     input: String,
 
     #[arg(help = "Output PPM file")]
     output: String,
+}
+
+// C-Callback mapping global std-in for our generic streaming FFI boundary
+extern "C" fn stdin_read_cb(_user_data: *mut std::ffi::c_void, buf: *mut u8, len: usize) -> usize {
+    let mut slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+    std::io::stdin().read(&mut slice).unwrap_or(0)
 }
 
 // Helper to convert and stream 8-bit color channels to standard 3-channel RGB PPM
@@ -109,20 +114,33 @@ fn main() {
         std::process::exit(1);
     }
 
-    let c_input = CString::new(args.input).unwrap();
     let mut width = 0;
     let mut height = 0;
     let mut bit_depth = 0;
     let mut color_type = 0;
 
-    let handle = unsafe {
-        open_png(
-            c_input.as_ptr(),
-                 &mut width,
-                 &mut height,
-                 &mut bit_depth,
-                 &mut color_type,
-        )
+    let handle = if args.input == "-" {
+        unsafe {
+            open_png_stream(
+                stdin_read_cb,
+                std::ptr::null_mut(),
+                            &mut width,
+                            &mut height,
+                            &mut bit_depth,
+                            &mut color_type,
+            )
+        }
+    } else {
+        let c_input = CString::new(args.input).unwrap();
+        unsafe {
+            open_png(
+                c_input.as_ptr(),
+                     &mut width,
+                     &mut height,
+                     &mut bit_depth,
+                     &mut color_type,
+            )
+        }
     };
 
     if handle.is_null() {
@@ -135,19 +153,17 @@ fn main() {
              width, height, bit_depth, color_type
     );
 
-    // Calculate the source bytes per scanline
     let channels = match color_type {
-        0 => 1, // Grayscale
-        2 => 3, // RGB
-        3 => 1, // Indexed
-        4 => 2, // Grayscale + Alpha
-        6 => 4, // RGBA
+        0 => 1,
+        2 => 3,
+        3 => 1,
+        4 => 2,
+        6 => 4,
         _ => 1,
     };
     let bits_per_pixel = channels * bit_depth as usize;
     let bytes_per_scanline = (width as usize * bits_per_pixel + 7) / 8;
 
-    // Determine batch size based on memory or input constraints
     let num_scanlines = if let Some(s) = args.scanlines {
         s
     } else if let Some(m) = args.mem_mib {
@@ -155,14 +171,13 @@ fn main() {
         let s = max_bytes / (bytes_per_scanline as u32);
         if s == 0 { 1 } else { s }
     } else {
-        10 // Default block size
+        10
     };
 
     println!("Streaming in batches of {} scanline(s)", num_scanlines);
 
     let mut out_file = BufWriter::new(File::create(&args.output).expect("Failed to create output"));
 
-    // Write standard PPM P6 Header (Max Val is 255 for 8-bit, 65535 for 16-bit)
     let max_val = if bit_depth == 16 { 65535 } else { 255 };
     writeln!(out_file, "P6\n{} {}\n{}", width, height, max_val).unwrap();
 
@@ -171,12 +186,11 @@ fn main() {
     loop {
         let result = unsafe { decode_scanlines(handle, num_scanlines) };
         if result.size == 0 || result.data.is_null() {
-            break; // EOF reached
+            break;
         }
 
         let raw_slice = unsafe { std::slice::from_raw_parts(result.data, result.size) };
 
-        // Transform the streamed block on-the-fly into clean RGB and write to file
         if bit_depth == 16 {
             write_rgb_16bit(&mut out_file, raw_slice, color_type);
         } else {
