@@ -1,0 +1,11 @@
+[package]
+name = "decoder"
+version = "0.5.0"
+edition = "2024"
+
+[lib]
+name = "pngstreamdec"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }

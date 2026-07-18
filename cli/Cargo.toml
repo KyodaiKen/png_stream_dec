@@ -1,0 +1,15 @@
+[package]
+name = "cli"
+version = "0.5.0"
+edition = "2024"
+
+[dependencies]
+decoder = { path = "../decoder" }
+anstream = "1.0"
+owo-colors = "4.0"
+chrono = "0.4"
+clap = { version = "4.0", features = ["derive"] }
+
+[[bin]]
+name = "pngstreamdec-cli"
+path = "src/main.rs"

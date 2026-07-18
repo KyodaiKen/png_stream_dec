@@ -1,20 +1,9 @@
-[package]
-name = "png_stream_dec"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = ["decoder", "cli"]
+resolver = "3"
 
-# We compile both as a static C-library (.a) and a standard rust lib (.rlib)
-[lib]
-name = "pngstreamdec"
-crate-type = ["staticlib", "rlib"]
-
-[[bin]]
-name = "test_png_stream_dec"
-path = "src/main.rs"
-
-[dependencies]
-flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
-clap = { version = "4.0", features = ["derive"] }
-anstream = "1.0"
-owo-colors = "4.0"
-chrono = "0.4"
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = 'symbols'

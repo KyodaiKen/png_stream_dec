@@ -36,12 +36,12 @@ struct Args {
 }
 
 // C-Callback mapping global std-in for our generic streaming FFI boundary
-extern "C" fn stdin_read_cb(_user_data: *mut std::ffi::c_void, buf: *mut u8, len: usize) -> usize {
+unsafe extern "C" fn stdin_read_cb(_user_data: *mut std::ffi::c_void, buf: *mut u8, len: usize) -> usize {
     let mut slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
     std::io::stdin().read(&mut slice).unwrap_or(0)
 }
 
-extern "C" {
+unsafe extern "C" {
     fn get_last_error() -> *const std::os::raw::c_char;
     fn free_error_string(ptr: *mut std::os::raw::c_char);
 }
@@ -201,29 +201,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes_per_scanline = 0;
 
     let handle = if args.input == "-" {
-        {
-            open_png_stream(
-                stdin_read_cb,
-                std::ptr::null_mut(),
-                            &mut width,
-                            &mut height,
-                            &mut bit_depth,
-                            &mut color_type,
-                            &mut bytes_per_scanline,
-            )
-        }
+        open_png_stream(
+            stdin_read_cb,
+            std::ptr::null_mut(),
+                        &mut width,
+                        &mut height,
+                        &mut bit_depth,
+                        &mut color_type,
+                        &mut bytes_per_scanline,
+        )
     } else {
         let c_input = CString::new(args.input).map_err(|e| format!("Invalid input string: {}", e))?;
-        {
-            open_png(
-                c_input.as_ptr(),
-                     &mut width,
-                     &mut height,
-                     &mut bit_depth,
-                     &mut color_type,
-                     &mut bytes_per_scanline,
-            )
-        }
+        open_png(
+            c_input.as_ptr(),
+                    &mut width,
+                    &mut height,
+                    &mut bit_depth,
+                    &mut color_type,
+                    &mut bytes_per_scanline,
+        )
     };
 
     if handle.is_null() {

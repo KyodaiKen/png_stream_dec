@@ -81,7 +81,7 @@ pub struct AuxiliaryMetadata {
     pub text_chunks: Vec<TextMetadata>,
 }
 
-pub type PngReadCallback = extern "C" fn(user_data: *mut std::ffi::c_void, buf: *mut u8, len: usize) -> usize;
+pub type PngReadCallback = unsafe extern "C" fn(user_data: *mut std::ffi::c_void, buf: *mut u8, len: usize) -> usize;
 
 struct FfiReader {
     cb: PngReadCallback,
@@ -90,7 +90,7 @@ struct FfiReader {
 
 impl Read for FfiReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let bytes_read = (self.cb)(self.user_data, buf.as_mut_ptr(), buf.len());
+        let bytes_read = unsafe { (self.cb)(self.user_data, buf.as_mut_ptr(), buf.len()) };
         Ok(bytes_read)
     }
 }
@@ -430,7 +430,7 @@ impl PngDecoder {
 // FFI BOUNDARY - C API
 // =========================================================================
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn open_png(
     filename: *const c_char,
     width: *mut u32,
@@ -466,7 +466,7 @@ pub extern "C" fn open_png(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn open_png_stream(
     read_cb: PngReadCallback,
     user_data: *mut std::ffi::c_void,
@@ -494,7 +494,7 @@ pub extern "C" fn open_png_stream(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn decode_scanlines(
     handle: *mut PngDecoder,
     mut num_scanlines: u32,
@@ -696,7 +696,7 @@ pub extern "C" fn decode_scanlines(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn close_png(handle: *mut PngDecoder) -> bool {
     if handle.is_null() {
         return false;
@@ -707,7 +707,7 @@ pub extern "C" fn close_png(handle: *mut PngDecoder) -> bool {
     true
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn get_last_error() -> *const c_char {
     LAST_ERROR.with(|e| {
         let err = e.borrow();
@@ -720,14 +720,14 @@ pub extern "C" fn get_last_error() -> *const c_char {
     })
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn free_error_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe { let _ = CString::from_raw(ptr); }
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn png_get_physics(
     handle: *mut PngDecoder,
     x: *mut u32,
@@ -747,7 +747,7 @@ pub extern "C" fn png_get_physics(
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn png_get_time(handle: *mut PngDecoder, out_epoch: *mut i64) -> bool {
     let dec = unsafe { &*handle };
     if dec.meta.has_time {
@@ -758,13 +758,13 @@ pub extern "C" fn png_get_time(handle: *mut PngDecoder, out_epoch: *mut i64) -> 
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn png_get_text_count(handle: *mut PngDecoder) -> usize {
     let dec = unsafe { &*handle };
     dec.meta.text_chunks.len()
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn png_get_text_data(
     handle: *mut PngDecoder,
     index: usize,
