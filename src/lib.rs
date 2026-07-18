@@ -26,27 +26,59 @@ pub struct PngDecoder {
     pub bit_depth: u8,
     pub color_type: u8,
     bytes_per_pixel: usize,
-    pub bytes_per_scanline: usize, // Input stride
-    pub output_stride: usize,      // Output stride
+    pub bytes_per_scanline: usize,
+    pub output_stride: usize,
 
     current_y: u32,
     idat_remaining: usize,
 
     uncompressed_buffer: Vec<u8>,
     prev_scanline: Vec<u8>,
-    pending_drain: usize, // Tracks bytes to remove on the next call to avoid re-allocating
+    pending_drain: usize,
 
     palette: Vec<[u8; 3]>,
     transparency: Vec<u8>,
 
     idat_crc: flate2::Crc,
     idat_corrupted: bool,
+
+    pub meta: AuxiliaryMetadata,
 }
 
 #[repr(C)]
 pub struct ScanlinesResult {
     pub data: *const u8,
     pub size: usize,
+}
+
+pub struct TextMetadata {
+    pub keyword: String,
+    pub text: String,
+    pub language: String,
+}
+
+#[derive(Default)]
+pub struct AuxiliaryMetadata {
+    pub phys_x: u32,
+    pub phys_y: u32,
+    pub phys_unit: u8,
+    pub has_phys: bool,
+
+    pub gamma: u32,
+    pub has_gamma: bool,
+    pub srgb_intent: u8,
+    pub has_srgb: bool,
+    pub chrm_data: [u32; 8],
+    pub has_chrm: bool,
+
+    pub histogram: Vec<u16>,
+
+    pub unix_epoch: i64,
+    pub has_time: bool,
+
+    pub bkgd_bytes: Vec<u8>,
+
+    pub text_chunks: Vec<TextMetadata>,
 }
 
 pub type PngReadCallback = extern "C" fn(user_data: *mut std::ffi::c_void, buf: *mut u8, len: usize) -> usize;
@@ -63,7 +95,20 @@ impl Read for FfiReader {
     }
 }
 
-// Runs the filter logic strictly in-place with zero loop branching and zero modulo operations.
+fn utc_to_epoch(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> i64 {
+    let y = year as i64;
+    let m = month as i64;
+    let d = day as i64;
+
+    let m_adj = (m + 9) % 12;
+    let y_adj = y - m / 10;
+
+    let days = 365 * y_adj + y_adj / 4 - y_adj / 100 + y_adj / 400 + (m_adj * 306 + 5) / 10 + d - 1;
+    let days_since_epoch = days - 719468;
+
+    days_since_epoch * 86400 + (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64)
+}
+
 fn unfilter_scanline_inplace(
     filter_type: u8,
     bpp: usize,
@@ -75,7 +120,6 @@ fn unfilter_scanline_inplace(
 ) {
     match filter_type {
         0 => {
-            // None: Direct copy/shift
             for i in 0..bytes_per_scanline {
                 let val = buffer[src_start + i];
                 buffer[dest_start + i] = val;
@@ -83,7 +127,6 @@ fn unfilter_scanline_inplace(
             }
         }
         1 => {
-            // Sub: Depends only on 'left'
             for i in 0..bytes_per_scanline {
                 let left = if i >= bpp { buffer[dest_start + i - bpp] } else { 0 };
                 let val = buffer[src_start + i].wrapping_add(left);
@@ -92,7 +135,6 @@ fn unfilter_scanline_inplace(
             }
         }
         2 => {
-            // Up: Depends only on 'up'
             for i in 0..bytes_per_scanline {
                 let up = prev_scanline[i];
                 let val = buffer[src_start + i].wrapping_add(up);
@@ -101,7 +143,6 @@ fn unfilter_scanline_inplace(
             }
         }
         3 => {
-            // Average: Depends on 'left' and 'up'
             for i in 0..bytes_per_scanline {
                 let left = if i >= bpp { buffer[dest_start + i - bpp] } else { 0 };
                 let up = prev_scanline[i];
@@ -112,7 +153,6 @@ fn unfilter_scanline_inplace(
             }
         }
         4 => {
-            // Paeth: Depends on 'left', 'up', and 'up_left'
             let mut up_left_buf = [0u8; 8];
             let mut up_left_idx = 0;
 
@@ -129,7 +169,6 @@ fn unfilter_scanline_inplace(
                 let pr = if pa <= pb && pa <= pc { left } else if pb <= pc { up } else { up_left };
                 let val = buffer[src_start + i].wrapping_add(pr);
 
-                // Safe sliding pointer avoids expensive modulo (%) operations
                 if bpp > 0 {
                     up_left_buf[up_left_idx] = up;
                     up_left_idx += 1;
@@ -165,7 +204,6 @@ fn expand_indexed_inplace(
         let src_row_start = row * packed_row_stride;
         let dst_row_start = row * expanded_row_stride;
 
-        // Start write pointer at the very end of the current expanded scanline
         let mut write_idx = dst_row_start + expanded_row_stride;
 
         for i in (0..packed_row_stride).rev() {
@@ -175,7 +213,6 @@ fn expand_indexed_inplace(
                 let shift = p * bit_depth as usize;
                 let idx = (byte as usize >> shift) & mask;
 
-                // Unconditionally move write pointer back by the stride
                 write_idx -= pixel_stride;
 
                 let color = palette.get(idx).unwrap_or(&[0, 0, 0]);
@@ -210,7 +247,6 @@ impl PngDecoder {
         let mut ihdr = [0u8; 13];
         reader.read_exact(&mut ihdr).map_err(|_| "Failed to read IHDR payload".to_string())?;
 
-        // Vital Check: IHDR CRC
         let mut ihdr_crc = flate2::Crc::new();
         ihdr_crc.update(b"IHDR");
         ihdr_crc.update(&ihdr);
@@ -220,8 +256,8 @@ impl PngDecoder {
             return Err("Corrupt IHDR chunk (CRC mismatch)".to_string());
         }
 
-        let width = u32::from_be_bytes(ihdr[0..4].try_into().unwrap());
-        let height = u32::from_be_bytes(ihdr[4..8].try_into().unwrap());
+        let width = u32::from_be_bytes(ihdr[0..4].try_into().map_err(|_| "Malformed IHDR structural width".to_string())?);
+        let height = u32::from_be_bytes(ihdr[4..8].try_into().map_err(|_| "Malformed IHDR structural height".to_string())?);
         let bit_depth = ihdr[8];
         let color_type = ihdr[9];
         let interlace = ihdr[12];
@@ -232,76 +268,122 @@ impl PngDecoder {
         }
 
         let channels = match color_type {
-            0 => 1, // Grayscale
-            2 => 3, // RGB
-            3 => 1, // Indexed
-            4 => 2, // Grayscale + Alpha
-            6 => 4, // RGBA
+            0 => 1,
+            2 => 3,
+            3 => 1,
+            4 => 2,
+            6 => 4,
             _ => return Err("Unknown color type".to_string()),
         };
 
         let bits_per_pixel = channels * bit_depth as usize;
         let bytes_per_pixel = cmp::max(1, bits_per_pixel / 8);
 
-        // Parse Palette Chunks
         let mut palette = Vec::new();
         let mut transparency = Vec::new();
         let mut idat_crc = flate2::Crc::new();
+        let mut meta = AuxiliaryMetadata::default();
 
-        // We must parse chunks between IHDR and IDAT
         loop {
             let (len, chunk_type) = Self::read_chunk_header(&mut reader)?;
+
+            if chunk_type == *b"IDAT" {
+                idat_remaining = len;
+                idat_crc.update(b"IDAT");
+                break;
+            }
+
+            let mut payload = vec![0u8; len];
+            reader.read_exact(&mut payload).map_err(|_| "Failed reading payload".to_string())?;
+            let mut chunk_crc_bytes = [0u8; 4];
+            reader.read_exact(&mut chunk_crc_bytes).map_err(|_| "Failed reading CRC".to_string())?;
+
+            let mut crc_check = flate2::Crc::new();
+            crc_check.update(&chunk_type);
+            crc_check.update(&payload);
+            if crc_check.sum() != u32::from_be_bytes(chunk_crc_bytes) {
+                continue;
+            }
+
             match &chunk_type {
                 b"PLTE" => {
-                    let mut data = vec![0u8; len];
-                    reader.read_exact(&mut data).map_err(|_| "Failed to read PLTE".to_string())?;
-
-                    // Vital Check: PLTE CRC
-                    let mut plte_crc = flate2::Crc::new();
-                    plte_crc.update(b"PLTE");
-                    plte_crc.update(&data);
-                    let mut crc_bytes = [0u8; 4];
-                    reader.read_exact(&mut crc_bytes).map_err(|_| "Failed to read PLTE CRC".to_string())?;
-                    if plte_crc.sum() != u32::from_be_bytes(crc_bytes) {
-                        return Err("Corrupt PLTE chunk (CRC mismatch)".to_string());
-                    }
-
-                    for chunk in data.chunks_exact(3) {
+                    for chunk in payload.chunks_exact(3) {
                         palette.push([chunk[0], chunk[1], chunk[2]]);
                     }
                 }
                 b"tRNS" => {
-                    let mut data = vec![0u8; len];
-                    reader.read_exact(&mut data).map_err(|_| "Failed to read tRNS".to_string())?;
-
-                    let mut trns_crc = flate2::Crc::new();
-                    trns_crc.update(b"tRNS");
-                    trns_crc.update(&data);
-                    let mut crc_bytes = [0u8; 4];
-                    reader.read_exact(&mut crc_bytes).map_err(|_| "Failed to read tRNS CRC".to_string())?;
-
-                    if trns_crc.sum() != u32::from_be_bytes(crc_bytes) {
-                        // Optional chunk error: Ignore the broken chunk and continue
-                        continue;
+                    transparency = payload;
+                }
+                b"pHYs" => {
+                    if len == 9 {
+                        meta.phys_x = u32::from_be_bytes(payload[0..4].try_into().map_err(|_| "Malformed pHYs width".to_string())?);
+                        meta.phys_y = u32::from_be_bytes(payload[4..8].try_into().map_err(|_| "Malformed pHYs height".to_string())?);
+                        meta.phys_unit = payload[8];
+                        meta.has_phys = true;
                     }
-                    transparency = data;
                 }
-                b"IDAT" => {
-                    idat_remaining = len;
-                    idat_crc.update(b"IDAT");
-                    break;
+                b"gAMA" => {
+                    if len == 4 {
+                        meta.gamma = u32::from_be_bytes(payload[0..4].try_into().map_err(|_| "Malformed gAMA configuration".to_string())?);
+                        meta.has_gamma = true;
+                    }
                 }
-                _ => {
-                    // Non-vital/Unknown chunk handling
-                    let mut data = vec![0u8; len];
-                    let _ = reader.read_exact(&mut data);
-                    let _ = reader.read_exact(&mut crc_bytes);
-                    // Ignored regardless of correctness
+                b"sRGB" => {
+                    if len == 1 {
+                        meta.srgb_intent = payload[0];
+                        meta.has_srgb = true;
+                    }
                 }
+                b"tIME" => {
+                    if len == 7 {
+                        let year = u16::from_be_bytes(payload[0..2].try_into().map_err(|_| "Malformed tIME year sequence".to_string())?);
+                        let month = payload[2];
+                        let day = payload[3];
+                        let hour = payload[4];
+                        let minute = payload[5];
+                        let second = payload[6];
+
+                        meta.unix_epoch = utc_to_epoch(year, month, day, hour, minute, second);
+                        meta.has_time = true;
+                    }
+                }
+                b"hIST" => {
+                    meta.histogram = payload.chunks_exact(2)
+                    .map(|c| {
+                        let arr: [u8; 2] = c.try_into().unwrap_or([0, 0]);
+                        u16::from_be_bytes(arr)
+                    })
+                    .collect();
+                }
+                b"bKGD" => {
+                    meta.bkgd_bytes = payload;
+                }
+                b"tEXt" => {
+                    if let Some(split) = payload.iter().position(|&b| b == 0) {
+                        let keyword = String::from_utf8_lossy(&payload[..split]).into_owned();
+                        let text = String::from_utf8_lossy(&payload[split + 1..]).into_owned();
+                        meta.text_chunks.push(TextMetadata { keyword, text, language: String::new() });
+                    }
+                }
+                b"zTXt" => {
+                    if let Some(split) = payload.iter().position(|&b| b == 0) {
+                        let keyword = String::from_utf8_lossy(&payload[..split]).into_owned();
+                        let comp_method = payload[split + 1];
+                        if comp_method == 0 {
+                            let mut deflater = flate2::Decompress::new(true);
+                            let mut uncompressed_text = Vec::new();
+                            if deflater.decompress(&payload[split + 2..], &mut uncompressed_text, flate2::FlushDecompress::Finish).is_ok() {
+                                let text = String::from_utf8_lossy(&uncompressed_text).into_owned();
+                                meta.text_chunks.push(TextMetadata { keyword, text, language: String::new() });
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
-        let bytes_per_scanline = (width as usize * bits_per_pixel + 7) / 8; // Input Stride
+        let bytes_per_scanline = (width as usize * bits_per_pixel + 7) / 8;
         let output_stride = if color_type == 3 {
             let pixel_stride = if !transparency.is_empty() { 4 } else { 3 };
             width as usize * pixel_stride
@@ -312,22 +394,23 @@ impl PngDecoder {
         Ok(Self {
             reader,
             decompressor: Decompress::new(true),
-            width,
-            height,
-            bit_depth,
-            color_type,
-            bytes_per_pixel,
-            bytes_per_scanline,
-            output_stride,
-            current_y: 0,
-            idat_remaining,
-            uncompressed_buffer: Vec::new(),
-            prev_scanline: vec![0; bytes_per_scanline],
-            pending_drain: 0,
-            palette,
-            transparency,
-            idat_crc,
-            idat_corrupted: false,
+           width,
+           height,
+           bit_depth,
+           color_type,
+           bytes_per_pixel,
+           bytes_per_scanline,
+           output_stride,
+           current_y: 0,
+           idat_remaining,
+           uncompressed_buffer: Vec::new(),
+           prev_scanline: vec![0; bytes_per_scanline],
+           pending_drain: 0,
+           palette,
+           transparency,
+           idat_crc,
+           idat_corrupted: false,
+           meta,
         })
     }
 
@@ -336,7 +419,7 @@ impl PngDecoder {
         if reader.read_exact(&mut head).is_err() {
             return Err("EOF reached".to_string());
         }
-        let len = u32::from_be_bytes(head[0..4].try_into().unwrap()) as usize;
+        let len = u32::from_be_bytes(head[0..4].try_into().map_err(|_| "Invalid chunk length extraction".to_string())?) as usize;
         let mut c_type = [0u8; 4];
         c_type.copy_from_slice(&head[4..8]);
         Ok((len, c_type))
@@ -377,7 +460,7 @@ pub extern "C" fn open_png(
             Box::into_raw(Box::new(decoder))
         },
         Err(e) => {
-            set_last_error(&e); // Capture the error
+            set_last_error(&e);
             ptr::null_mut()
         }
     }
@@ -405,7 +488,7 @@ pub extern "C" fn open_png_stream(
             Box::into_raw(Box::new(decoder))
         },
         Err(e) => {
-            set_last_error(&e); // Capture the error
+            set_last_error(&e);
             ptr::null_mut()
         }
     }
@@ -431,7 +514,6 @@ pub extern "C" fn decode_scanlines(
         num_scanlines = dec.height - dec.current_y;
     }
 
-    // Safety fallback: if an IDAT chunk was flagged corrupted on prior iterations, output zeroes directly
     if dec.idat_corrupted {
         let lines_to_process = num_scanlines as usize;
         dec.uncompressed_buffer.clear();
@@ -478,7 +560,6 @@ pub extern "C" fn decode_scanlines(
                             dec.idat_crc.update(b"IDAT");
                             break;
                         } else {
-                            // Non-critical streaming chunk handling: validate & skip
                             let mut chunk_data = vec![0u8; len];
                             if dec.reader.read_exact(&mut chunk_data).is_err() { break; }
                             let mut crc_bytes = [0u8; 4];
@@ -521,7 +602,6 @@ pub extern "C" fn decode_scanlines(
                 FlushDecompress::None,
             );
 
-            // Handle inflation errors without panicking
             if res.is_err() {
                 dec.idat_corrupted = true;
                 break;
@@ -535,7 +615,6 @@ pub extern "C" fn decode_scanlines(
         }
     }
 
-    // Zero-fill handler when corruption is detected in mid-stream inside the execution loop
     if dec.idat_corrupted {
         let lines_to_process = num_scanlines as usize;
         dec.uncompressed_buffer.clear();
@@ -584,10 +663,8 @@ pub extern "C" fn decode_scanlines(
         let original_len = dec.uncompressed_buffer.len();
         let remainder_size = original_len - packed_size_with_filters;
 
-        // Resize single buffer to hold the expanded pixels PLUS the zlib remainder
         dec.uncompressed_buffer.resize(expanded_size + remainder_size, 0);
 
-        // Shift the untouched zlib stream data safely out of the way
         if remainder_size > 0 {
             dec.uncompressed_buffer.copy_within(
                 packed_size_with_filters..original_len,
@@ -595,7 +672,6 @@ pub extern "C" fn decode_scanlines(
             );
         }
 
-        // Expand the compactly packed unfiltered pixels strictly in-place
         expand_indexed_inplace(
             &dec.palette,
             &dec.transparency,
@@ -606,7 +682,6 @@ pub extern "C" fn decode_scanlines(
             dec.output_stride,
         );
 
-        // Set the drain window to match the expanded output footprint
         dec.pending_drain = expanded_size;
 
         ScanlinesResult {
@@ -636,14 +711,82 @@ pub extern "C" fn close_png(handle: *mut PngDecoder) -> bool {
 pub extern "C" fn get_last_error() -> *const c_char {
     LAST_ERROR.with(|e| {
         let err = e.borrow();
-        CString::new(err.as_str()).unwrap().into_raw()
+        // Strip out internal null bytes so initializing CString is structurally guaranteed to pass
+        let sanitized: Vec<u8> = err.bytes().filter(|&b| b != 0).collect();
+        match CString::new(sanitized) {
+            Ok(c_str) => c_str.into_raw(),
+                    Err(_) => ptr::null()
+        }
     })
 }
 
-// Memory cleanup for the error string
 #[no_mangle]
 pub extern "C" fn free_error_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe { let _ = CString::from_raw(ptr); }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn png_get_physics(
+    handle: *mut PngDecoder,
+    x: *mut u32,
+    y: *mut u32,
+    unit: *mut u8
+) -> bool {
+    let dec = unsafe { &*handle };
+    if dec.meta.has_phys {
+        unsafe {
+            if !x.is_null() { *x = dec.meta.phys_x; }
+            if !y.is_null() { *y = dec.meta.phys_y; }
+            if !unit.is_null() { *unit = dec.meta.phys_unit; }
+        }
+        true
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn png_get_time(handle: *mut PngDecoder, out_epoch: *mut i64) -> bool {
+    let dec = unsafe { &*handle };
+    if dec.meta.has_time {
+        unsafe { *out_epoch = dec.meta.unix_epoch; }
+        true
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn png_get_text_count(handle: *mut PngDecoder) -> usize {
+    let dec = unsafe { &*handle };
+    dec.meta.text_chunks.len()
+}
+
+#[no_mangle]
+pub extern "C" fn png_get_text_data(
+    handle: *mut PngDecoder,
+    index: usize,
+    out_keyword: *mut *const c_char,
+    out_text: *mut *const c_char
+) -> bool {
+    let dec = unsafe { &*handle };
+    if let Some(item) = dec.meta.text_chunks.get(index) {
+        // Sanitize string content bytes to completely bypass formatting crash scenarios
+        let clean_key: Vec<u8> = item.keyword.bytes().filter(|&b| b != 0).collect();
+        let clean_text: Vec<u8> = item.text.bytes().filter(|&b| b != 0).collect();
+
+        if let (Ok(c_keyword), Ok(c_text)) = (CString::new(clean_key), CString::new(clean_text)) {
+            unsafe {
+                *out_keyword = c_keyword.into_raw();
+                *out_text = c_text.into_raw();
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
     }
 }
