@@ -53,24 +53,20 @@ fn write_rgb_8bit<W: Write>(writer: &mut W, raw_data: &[u8], color_type: u8) {
         2 | 3 => { // RGB -> RGB (Direct write)
             writer.write_all(raw_data).unwrap();
         }
-        4 => { // Grayscale + Alpha -> RGB (Ignore Alpha)
-            let mut rgb = Vec::with_capacity((raw_data.len() / 2) * 3);
+        4 => { // Grayscale + Alpha -> RGBA
+            let mut rgba = Vec::with_capacity((raw_data.len() / 2) * 4);
             for chunk in raw_data.chunks_exact(2) {
                 let y = chunk[0];
-                rgb.push(y);
-                rgb.push(y);
-                rgb.push(y);
+                let a = chunk[1];
+                rgba.push(y);
+                rgba.push(y);
+                rgba.push(y);
+                rgba.push(a);
             }
-            writer.write_all(&rgb).unwrap();
+            writer.write_all(&rgba).unwrap();
         }
-        6 => { // RGBA -> RGB (Ignore Alpha)
-            let mut rgb = Vec::with_capacity((raw_data.len() / 4) * 3);
-            for chunk in raw_data.chunks_exact(4) {
-                rgb.push(chunk[0]);
-                rgb.push(chunk[1]);
-                rgb.push(chunk[2]);
-            }
-            writer.write_all(&rgb).unwrap();
+        6 => { // RGBA -> RGBA (Direct write)
+            writer.write_all(raw_data).unwrap();
         }
         _ => {}
     }
@@ -94,24 +90,24 @@ fn write_rgb_16bit<W: Write>(writer: &mut W, raw_data: &[u8], color_type: u8) {
         2 => { // RGB 16-bit -> RGB 16-bit
             writer.write_all(raw_data).unwrap();
         }
-        4 => { // Grayscale + Alpha 16-bit -> RGB 16-bit
-            let mut rgb = Vec::with_capacity((raw_data.len() / 4) * 3);
+        4 => { // Grayscale + Alpha 16-bit -> RGBA 16-bit
+            let mut rgba = Vec::with_capacity(raw_data.len() * 2);
             for chunk in raw_data.chunks_exact(4) {
-                let hi = chunk[0];
-                let lo = chunk[1];
+                let hi_y = chunk[0];
+                let lo_y = chunk[1];
+                let hi_a = chunk[2];
+                let lo_a = chunk[3];
                 for _ in 0..3 {
-                    rgb.push(hi);
-                    rgb.push(lo);
+                    rgba.push(hi_y);
+                    rgba.push(lo_y);
                 }
+                rgba.push(hi_a);
+                rgba.push(lo_a);
             }
-            writer.write_all(&rgb).unwrap();
+            writer.write_all(&rgba).unwrap();
         }
-        6 => { // RGBA 16-bit -> RGB 16-bit (Ignore Alpha, copy 6 bytes out of 8)
-            let mut rgb = Vec::with_capacity((raw_data.len() / 8) * 6);
-            for chunk in raw_data.chunks_exact(8) {
-                rgb.extend_from_slice(&chunk[0..6]);
-            }
-            writer.write_all(&rgb).unwrap();
+        6 => { // RGBA 16-bit -> RGBA 16-bit (Direct write)
+            writer.write_all(raw_data).unwrap();
         }
         _ => {}
     }
@@ -184,10 +180,34 @@ fn main() {
 
     println!("Streaming in batches of {} scanline(s), output stride is {}", num_scanlines, bytes_per_scanline);
 
-    let mut out_file = BufWriter::new(File::create(&args.output).expect("Failed to create output"));
+    // Convert the output string into a PathBuf for safe extension manipulation
+    let mut output_path = std::path::PathBuf::from(&args.output);
+
+    // Detect alpha color types (4 = Gray+Alpha, 6 = RGBA)
+    if (color_type == 4 || color_type == 6) && output_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("ppm")) {
+        output_path.set_extension("pam");
+        println!(
+            "Warning: Alpha channel detected in source image. Swapping output extension from .ppm to .pam ({})",
+                 output_path.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
+    // Pass the modified path to the file creator instead of the raw args.output string
+    let mut out_file = BufWriter::new(File::create(&output_path).expect("Failed to create output"));
 
     let max_val = if bit_depth == 16 { 65535 } else { 255 };
-    writeln!(out_file, "P6\n{} {}\n{}", width, height, max_val).unwrap();
+
+    if color_type == 4 || color_type == 6 {
+        // Write PAM (P7) header for RGBA support
+        writeln!(
+            out_file,
+            "P7\nWIDTH {}\nHEIGHT {}\nDEPTH 4\nMAXVAL {}\nTUPLTYPE RGB_ALPHA\nENDHDR",
+            width, height, max_val
+        ).unwrap();
+    } else {
+        // Write standard PPM (P6) header for RGB support
+        writeln!(out_file, "P6\n{} {}\n{}", width, height, max_val).unwrap();
+    }
 
     let mut total_decoded = 0;
 
