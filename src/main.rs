@@ -8,10 +8,21 @@ use pngstreamdec::{open_png, open_png_stream, decode_scanlines, close_png};
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Stream PNG to PPM")]
 struct Args {
-    #[arg(short = 'm', long, help = "Max memory in MiB (mutually exclusive with -s)")]
-    mem_mib: Option<f64>,
+    #[arg(
+        short = 'm',
+        long,
+        default_value_t = 8.0,
+        conflicts_with = "scanlines",
+        help = "Max memory in MiB"
+    )]
+    mem_mib: f64,
 
-    #[arg(short = 's', long, help = "Num scanlines per block (mutually exclusive with -m)")]
+    #[arg(
+        short = 's',
+        long,
+        conflicts_with = "mem_mib",
+        help = "Num scanlines per block"
+    )]
     scanlines: Option<u32>,
 
     #[arg(help = "Input PNG file (use '-' for stdin)")]
@@ -108,12 +119,6 @@ fn write_rgb_16bit<W: Write>(writer: &mut W, raw_data: &[u8], color_type: u8) {
 
 fn main() {
     let args = Args::parse();
-
-    if args.mem_mib.is_some() && args.scanlines.is_some() {
-        eprintln!("Error: Cannot use -m and -s together.");
-        std::process::exit(1);
-    }
-
     let mut width = 0;
     let mut height = 0;
     let mut bit_depth = 0;
@@ -169,12 +174,12 @@ fn main() {
 
     let num_scanlines = if let Some(s) = args.scanlines {
         s
-    } else if let Some(m) = args.mem_mib {
-        let max_bytes = (m * 1024.0 * 1024.0) as u32;
+    } else {
+        // mem_mib is now just an f64, no need to check Some()
+        let m = args.mem_mib;
+        let max_bytes = ((m - 3.25) * 1024.0 * 1024.0) as u32;
         let s = max_bytes / (bytes_per_scanline as u32);
         if s == 0 { 1 } else { s }
-    } else {
-        10
     };
 
     println!("Streaming in batches of {} scanline(s), output stride is {}", num_scanlines, bytes_per_scanline);
