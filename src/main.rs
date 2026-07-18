@@ -171,32 +171,33 @@ fn main() {
     let num_scanlines = if let Some(s) = args.scanlines {
         s
     } else {
-        // Fixed baseline overhead (independent of scanline count)
-        let zlib_overhead = 45_000;       // Internal history window & tables for zlib inflate
-        let io_overhead = 16_384;         // Combined capacity for BufReader + BufWriter channels
-        let runtime_cushion = 1_500_000;   // ~1.43 MiB baseline for the Rust runtime & allocator alignment
-        let baseline_bytes = zlib_overhead + io_overhead + runtime_cushion;
+        // 1. True baseline process overhead (independent of scanline count)
+        let process_rss_footprint = 2_800_000; // Mapped binary pages, system allocator metadata, & libc
+        let zlib_overhead = 45_000;            // Internal history window & tables for zlib inflate
+        let io_overhead = 65_536;              // Upper cushion for standard I/O channels (BufReader/BufWriter)
+        let baseline_bytes = process_rss_footprint + zlib_overhead + io_overhead;
 
-        // Dynamic transient memory multiplier per scanline in main.rs
-        // Note: `bytes_per_scanline` passed from the library is actually the `output_stride`.
+        // 2. Dynamic transient memory multiplier per scanline in main.rs
         let transient_multiplier = match color_type {
             0 => 3, // Grayscale: main.rs allocates a temporary vector 3x the size of the stride
             4 => 2, // Grayscale + Alpha: main.rs allocates a temporary vector 2x the size of the stride
             _ => 0, // Types 2 (RGB), 3 (Indexed), and 6 (RGBA) write directly with 0 extra allocations
         };
 
-        // Total bytes occupied by a single scanline during peak execution loop
-        let ram_per_scanline = bytes_per_scanline + (bytes_per_scanline * transient_multiplier);
+        // 3. Account for Vector growth capacity slack (Vec doubling strategy adds ~20% overhead)
+        let vec_growth_slack = 1.20;
+        let active_ram_per_line = bytes_per_scanline + (bytes_per_scanline * transient_multiplier);
+        let ram_per_scanline = (active_ram_per_line as f64 * vec_growth_slack) as usize;
 
-        // Convert user MiB target to raw bytes and calculate batch capacity
+        // 4. Convert user MiB target to raw bytes and calculate batch capacity
         let total_budget_bytes = (args.mem_mib * 1024.0 * 1024.0) as usize;
 
         if total_budget_bytes <= baseline_bytes {
             println!(
                 "{}",
-                format!("WARNING: Given memory is not sufficient. Using a single scanline to keep the memory small.").bright_yellow()
+                format!("WARNING: Given memory budget is too low for baseline execution. Falling back to 1 scanline.").bright_yellow()
             );
-            1 // Fallback safely to a single scanline if the user provides a tiny budget
+            1
         } else {
             let max_bytes_for_scanlines = total_budget_bytes - baseline_bytes;
             let s = (max_bytes_for_scanlines / ram_per_scanline) as u32;
