@@ -40,6 +40,11 @@ extern "C" fn stdin_read_cb(_user_data: *mut std::ffi::c_void, buf: *mut u8, len
     std::io::stdin().read(&mut slice).unwrap_or(0)
 }
 
+extern "C" {
+    fn get_last_error() -> *const std::os::raw::c_char;
+    fn free_error_string(ptr: *mut std::os::raw::c_char);
+}
+
 // Helper to convert and stream 8-bit color channels to standard 3-channel RGB PPM
 fn write_rgb_8bit<W: Write>(writer: &mut W, raw_data: &[u8], color_type: u8) {
     match color_type {
@@ -150,7 +155,16 @@ fn main() {
     };
 
     if handle.is_null() {
-        eprintln!("Error: Could not open or parse PNG file.");
+        unsafe {
+            let err_ptr = get_last_error();
+            if !err_ptr.is_null() {
+                let c_str = std::ffi::CStr::from_ptr(err_ptr);
+                eprintln!("{}", format!("Error: {}", c_str.to_string_lossy()).bright_red());
+                free_error_string(err_ptr as *mut _);
+            } else {
+                eprintln!("Error: Could not open or parse PNG file.");
+            }
+        }
         std::process::exit(1);
     }
 

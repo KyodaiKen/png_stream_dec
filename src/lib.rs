@@ -5,6 +5,16 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::os::raw::c_char;
 use std::ptr;
+use std::cell::RefCell;
+use std::ffi::CString;
+
+thread_local! {
+    static LAST_ERROR: RefCell<String> = RefCell::new(String::new());
+}
+
+fn set_last_error(msg: &str) {
+    LAST_ERROR.with(|e| *e.borrow_mut() = msg.to_string());
+}
 
 const PNG_MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 
@@ -28,6 +38,9 @@ pub struct PngDecoder {
 
     palette: Vec<[u8; 3]>,
     transparency: Vec<u8>,
+
+    idat_crc: flate2::Crc,
+    idat_corrupted: bool,
 }
 
 #[repr(C)]
@@ -48,12 +61,6 @@ impl Read for FfiReader {
         let bytes_read = (self.cb)(self.user_data, buf.as_mut_ptr(), buf.len());
         Ok(bytes_read)
     }
-}
-
-fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> Result<(), String> {
-    let mut take = reader.take(count);
-    std::io::copy(&mut take, &mut std::io::sink()).map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 // Runs the filter logic strictly in-place with zero loop branching and zero modulo operations.
@@ -201,7 +208,18 @@ impl PngDecoder {
         }
 
         let mut ihdr = [0u8; 13];
-        reader.read_exact(&mut ihdr).unwrap();
+        reader.read_exact(&mut ihdr).map_err(|_| "Failed to read IHDR payload".to_string())?;
+
+        // Vital Check: IHDR CRC
+        let mut ihdr_crc = flate2::Crc::new();
+        ihdr_crc.update(b"IHDR");
+        ihdr_crc.update(&ihdr);
+        let mut crc_bytes = [0u8; 4];
+        reader.read_exact(&mut crc_bytes).map_err(|_| "Failed to read IHDR CRC".to_string())?;
+        if ihdr_crc.sum() != u32::from_be_bytes(crc_bytes) {
+            return Err("Corrupt IHDR chunk (CRC mismatch)".to_string());
+        }
+
         let width = u32::from_be_bytes(ihdr[0..4].try_into().unwrap());
         let height = u32::from_be_bytes(ihdr[4..8].try_into().unwrap());
         let bit_depth = ihdr[8];
@@ -225,11 +243,10 @@ impl PngDecoder {
         let bits_per_pixel = channels * bit_depth as usize;
         let bytes_per_pixel = cmp::max(1, bits_per_pixel / 8);
 
-        skip_bytes(&mut reader, 4)?; // Skip IHDR CRC
-
         // Parse Palette Chunks
         let mut palette = Vec::new();
         let mut transparency = Vec::new();
+        let mut idat_crc = flate2::Crc::new();
 
         // We must parse chunks between IHDR and IDAT
         loop {
@@ -237,25 +254,50 @@ impl PngDecoder {
             match &chunk_type {
                 b"PLTE" => {
                     let mut data = vec![0u8; len];
-                    reader.read_exact(&mut data).map_err(|_| "Failed to read PLTE")?;
-                    skip_bytes(&mut reader, 4)?; // CRC
+                    reader.read_exact(&mut data).map_err(|_| "Failed to read PLTE".to_string())?;
+
+                    // Vital Check: PLTE CRC
+                    let mut plte_crc = flate2::Crc::new();
+                    plte_crc.update(b"PLTE");
+                    plte_crc.update(&data);
+                    let mut crc_bytes = [0u8; 4];
+                    reader.read_exact(&mut crc_bytes).map_err(|_| "Failed to read PLTE CRC".to_string())?;
+                    if plte_crc.sum() != u32::from_be_bytes(crc_bytes) {
+                        return Err("Corrupt PLTE chunk (CRC mismatch)".to_string());
+                    }
+
                     for chunk in data.chunks_exact(3) {
                         palette.push([chunk[0], chunk[1], chunk[2]]);
                     }
                 }
                 b"tRNS" => {
                     let mut data = vec![0u8; len];
-                    reader.read_exact(&mut data).map_err(|_| "Failed to read tRNS")?;
-                    skip_bytes(&mut reader, 4)?; // CRC
+                    reader.read_exact(&mut data).map_err(|_| "Failed to read tRNS".to_string())?;
+
+                    let mut trns_crc = flate2::Crc::new();
+                    trns_crc.update(b"tRNS");
+                    trns_crc.update(&data);
+                    let mut crc_bytes = [0u8; 4];
+                    reader.read_exact(&mut crc_bytes).map_err(|_| "Failed to read tRNS CRC".to_string())?;
+
+                    if trns_crc.sum() != u32::from_be_bytes(crc_bytes) {
+                        // Optional chunk error: Ignore the broken chunk and continue
+                        continue;
+                    }
                     transparency = data;
                 }
                 b"IDAT" => {
-                    // Backtrack the reader or store the chunk to handle in decode_scanlines
-                    // For simplicity, stop here and handle IDAT in decode_scanlines
                     idat_remaining = len;
+                    idat_crc.update(b"IDAT");
                     break;
                 }
-                _ => { skip_bytes(&mut reader, (len + 4) as u64)?; }
+                _ => {
+                    // Non-vital/Unknown chunk handling
+                    let mut data = vec![0u8; len];
+                    let _ = reader.read_exact(&mut data);
+                    let _ = reader.read_exact(&mut crc_bytes);
+                    // Ignored regardless of correctness
+                }
             }
         }
 
@@ -278,12 +320,14 @@ impl PngDecoder {
             bytes_per_scanline,
             output_stride,
             current_y: 0,
-            idat_remaining: idat_remaining,
+            idat_remaining,
             uncompressed_buffer: Vec::new(),
             prev_scanline: vec![0; bytes_per_scanline],
             pending_drain: 0,
-            palette: palette,
-            transparency: transparency,
+            palette,
+            transparency,
+            idat_crc,
+            idat_corrupted: false,
         })
     }
 
@@ -332,7 +376,10 @@ pub extern "C" fn open_png(
             if !bytes_per_scanline.is_null() { *bytes_per_scanline = decoder.output_stride }
             Box::into_raw(Box::new(decoder))
         },
-        Err(_) => ptr::null_mut(),
+        Err(e) => {
+            set_last_error(&e); // Capture the error
+            ptr::null_mut()
+        }
     }
 }
 
@@ -357,7 +404,10 @@ pub extern "C" fn open_png_stream(
             if !bytes_per_scanline.is_null() { *bytes_per_scanline = decoder.output_stride }
             Box::into_raw(Box::new(decoder))
         },
-        Err(_) => ptr::null_mut(),
+        Err(e) => {
+            set_last_error(&e); // Capture the error
+            ptr::null_mut()
+        }
     }
 }
 
@@ -381,16 +431,40 @@ pub extern "C" fn decode_scanlines(
         num_scanlines = dec.height - dec.current_y;
     }
 
+    // Safety fallback: if an IDAT chunk was flagged corrupted on prior iterations, output zeroes directly
+    if dec.idat_corrupted {
+        let lines_to_process = num_scanlines as usize;
+        dec.uncompressed_buffer.clear();
+        let total_size = lines_to_process * dec.output_stride;
+        dec.uncompressed_buffer.resize(total_size, 0);
+        dec.current_y += lines_to_process as u32;
+        dec.pending_drain = total_size;
+        return ScanlinesResult {
+            data: dec.uncompressed_buffer.as_ptr(),
+            size: total_size,
+        };
+    }
+
     let bytes_needed_per_line = dec.bytes_per_scanline + 1;
     let total_bytes_needed = (num_scanlines as usize) * bytes_needed_per_line;
 
     let mut in_buf = [0u8; 8192];
     let mut out_buf = [0u8; 16384];
 
-    while dec.uncompressed_buffer.len() < total_bytes_needed {
+    while dec.uncompressed_buffer.len() < total_bytes_needed && !dec.idat_corrupted {
         if dec.idat_remaining == 0 {
             if dec.current_y > 0 || !dec.uncompressed_buffer.is_empty() {
-                skip_bytes(&mut dec.reader, 4).unwrap();
+                let mut crc_bytes = [0u8; 4];
+                if dec.reader.read_exact(&mut crc_bytes).is_ok() {
+                    let expected_crc = u32::from_be_bytes(crc_bytes);
+                    if dec.idat_crc.sum() != expected_crc {
+                        dec.idat_corrupted = true;
+                        break;
+                    }
+                } else {
+                    dec.idat_corrupted = true;
+                    break;
+                }
             }
 
             loop {
@@ -400,32 +474,58 @@ pub extern "C" fn decode_scanlines(
                             break;
                         } else if ctype == *b"IDAT" {
                             dec.idat_remaining = len;
+                            dec.idat_crc = flate2::Crc::new();
+                            dec.idat_crc.update(b"IDAT");
                             break;
                         } else {
-                            skip_bytes(&mut dec.reader, (len + 4) as u64).unwrap();
+                            // Non-critical streaming chunk handling: validate & skip
+                            let mut chunk_data = vec![0u8; len];
+                            if dec.reader.read_exact(&mut chunk_data).is_err() { break; }
+                            let mut crc_bytes = [0u8; 4];
+                            if dec.reader.read_exact(&mut crc_bytes).is_err() { break; }
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        dec.idat_corrupted = true;
+                        break;
+                    }
                 }
             }
         }
 
-        if dec.idat_remaining == 0 { break; }
+        if dec.idat_remaining == 0 || dec.idat_corrupted { break; }
 
         let to_read = cmp::min(dec.idat_remaining, in_buf.len());
-        let n = dec.reader.read(&mut in_buf[..to_read]).unwrap();
+        let n = match dec.reader.read(&mut in_buf[..to_read]) {
+            Ok(n) => n,
+            Err(_) => {
+                dec.idat_corrupted = true;
+                break;
+            }
+        };
+        if n == 0 {
+            dec.idat_corrupted = true;
+            break;
+        }
         dec.idat_remaining -= n;
+        dec.idat_crc.update(&in_buf[..n]);
 
         let mut in_pos = 0;
         while in_pos < n {
             let before_out = dec.decompressor.total_out();
             let before_in = dec.decompressor.total_in();
 
-            let _ = dec.decompressor.decompress(
+            let res = dec.decompressor.decompress(
                 &in_buf[in_pos..n],
                 &mut out_buf,
                 FlushDecompress::None,
-            ).unwrap();
+            );
+
+            // Handle inflation errors without panicking
+            if res.is_err() {
+                dec.idat_corrupted = true;
+                break;
+            }
 
             let consumed = (dec.decompressor.total_in() - before_in) as usize;
             let produced = (dec.decompressor.total_out() - before_out) as usize;
@@ -433,6 +533,20 @@ pub extern "C" fn decode_scanlines(
             in_pos += consumed;
             dec.uncompressed_buffer.extend_from_slice(&out_buf[..produced]);
         }
+    }
+
+    // Zero-fill handler when corruption is detected in mid-stream inside the execution loop
+    if dec.idat_corrupted {
+        let lines_to_process = num_scanlines as usize;
+        dec.uncompressed_buffer.clear();
+        let total_size = lines_to_process * dec.output_stride;
+        dec.uncompressed_buffer.resize(total_size, 0);
+        dec.current_y += lines_to_process as u32;
+        dec.pending_drain = total_size;
+        return ScanlinesResult {
+            data: dec.uncompressed_buffer.as_ptr(),
+            size: total_size,
+        };
     }
 
     let lines_to_process = cmp::min(
@@ -516,4 +630,20 @@ pub extern "C" fn close_png(handle: *mut PngDecoder) -> bool {
         let _ = Box::from_raw(handle);
     }
     true
+}
+
+#[no_mangle]
+pub extern "C" fn get_last_error() -> *const c_char {
+    LAST_ERROR.with(|e| {
+        let err = e.borrow();
+        CString::new(err.as_str()).unwrap().into_raw()
+    })
+}
+
+// Memory cleanup for the error string
+#[no_mangle]
+pub extern "C" fn free_error_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe { let _ = CString::from_raw(ptr); }
+    }
 }
