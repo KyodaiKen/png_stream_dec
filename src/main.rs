@@ -2,6 +2,8 @@ use clap::Parser;
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
+use anstream::println;
+use owo_colors::OwoColorize;
 
 use pngstreamdec::{open_png, open_png_stream, decode_scanlines, close_png};
 
@@ -152,30 +154,54 @@ fn main() {
         std::process::exit(1);
     }
 
-
-
-    let channels = match color_type {
-        0 => 1,
-        2 => 3,
-        3 => 1,
-        4 => 2,
-        6 => 4,
-        _ => 1,
+    let (channels, color_name) = match color_type {
+        0 => (1, "Grayscale"),
+        2 => (3, "RGB"),
+        3 => (1, "Indexed (Paletted)"),
+        4 => (2, "Grayscale + Alpha"),
+        6 => (4, "RGB + Alpha (RGBA)"),
+        _ => (1, "Unknown"),
     };
 
     println!(
-        "PNG Opened: {} x {} / {} bits per channel / color type {} / {} color channels",
-             width, height, bit_depth, color_type, channels
+        "PNG Opened: {} x {} / {} bpc / {} bpp / {}, {} ch",
+             width, height, bit_depth, bit_depth * channels, color_name, channels
     );
 
     let num_scanlines = if let Some(s) = args.scanlines {
         s
     } else {
-        // mem_mib is now just an f64, no need to check Some()
-        let m = args.mem_mib;
-        let max_bytes = ((m - 3.25) * 1024.0 * 1024.0) as u32;
-        let s = max_bytes / (bytes_per_scanline as u32);
-        if s == 0 { 1 } else { s }
+        // Fixed baseline overhead (independent of scanline count)
+        let zlib_overhead = 45_000;       // Internal history window & tables for zlib inflate
+        let io_overhead = 16_384;         // Combined capacity for BufReader + BufWriter channels
+        let runtime_cushion = 1_500_000;   // ~1.43 MiB baseline for the Rust runtime & allocator alignment
+        let baseline_bytes = zlib_overhead + io_overhead + runtime_cushion;
+
+        // Dynamic transient memory multiplier per scanline in main.rs
+        // Note: `bytes_per_scanline` passed from the library is actually the `output_stride`.
+        let transient_multiplier = match color_type {
+            0 => 3, // Grayscale: main.rs allocates a temporary vector 3x the size of the stride
+            4 => 2, // Grayscale + Alpha: main.rs allocates a temporary vector 2x the size of the stride
+            _ => 0, // Types 2 (RGB), 3 (Indexed), and 6 (RGBA) write directly with 0 extra allocations
+        };
+
+        // Total bytes occupied by a single scanline during peak execution loop
+        let ram_per_scanline = bytes_per_scanline + (bytes_per_scanline * transient_multiplier);
+
+        // Convert user MiB target to raw bytes and calculate batch capacity
+        let total_budget_bytes = (args.mem_mib * 1024.0 * 1024.0) as usize;
+
+        if total_budget_bytes <= baseline_bytes {
+            println!(
+                "{}",
+                format!("WARNING: Given memory is not sufficient. Using a single scanline to keep the memory small.").bright_yellow()
+            );
+            1 // Fallback safely to a single scanline if the user provides a tiny budget
+        } else {
+            let max_bytes_for_scanlines = total_budget_bytes - baseline_bytes;
+            let s = (max_bytes_for_scanlines / ram_per_scanline) as u32;
+            if s == 0 { 1 } else { s }
+        }
     };
 
     println!("Streaming in batches of {} scanline(s), output stride is {}", num_scanlines, bytes_per_scanline);
@@ -187,8 +213,11 @@ fn main() {
     if (color_type == 4 || color_type == 6) && output_path.extension().map_or(false, |ext| ext.eq_ignore_ascii_case("ppm")) {
         output_path.set_extension("pam");
         println!(
-            "Warning: Alpha channel detected in source image. Swapping output extension from .ppm to .pam ({})",
-                 output_path.file_name().unwrap_or_default().to_string_lossy()
+            "{}",
+            format!(
+                "WARNING: Alpha channel detected in source image. Swapping output extension from .ppm to .pam ({})",
+                    output_path.file_name().unwrap_or_default().to_string_lossy()
+            ).bright_yellow()
         );
     }
 

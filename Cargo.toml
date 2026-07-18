@@ -15,3 +15,5 @@ path = "src/main.rs"
 [dependencies]
 flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 clap = { version = "4.0", features = ["derive"] }
+anstream = "1.0"
+owo-colors = "4.0"
