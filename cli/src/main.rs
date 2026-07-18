@@ -48,7 +48,7 @@ unsafe extern "C" {
 
 /// Prints auxiliary chunk components to the console, automatically formatting
 /// timestamps to the execution environment's active locale and time zone.
-pub fn print_metadata_to_console(meta: &AuxiliaryMetadata) {
+pub fn print_metadata_to_console(meta: &AuxiliaryMetadata, width: u32, height: u32) {
     println!("\n================= PNG METADATA REPORT =================");
 
     // gAMA Chunk
@@ -76,6 +76,26 @@ pub fn print_metadata_to_console(meta: &AuxiliaryMetadata) {
         println!("   Red Channel : X={:.5}, Y={:.5}", meta.chrm_data[2] as f64 / 100_000.0, meta.chrm_data[3] as f64 / 100_000.0);
         println!("   Green Chan. : X={:.5}, Y={:.5}", meta.chrm_data[4] as f64 / 100_000.0, meta.chrm_data[5] as f64 / 100_000.0);
         println!("   Blue Channel: X={:.5}, Y={:.5}", meta.chrm_data[6] as f64 / 100_000.0, meta.chrm_data[7] as f64 / 100_000.0);
+    }
+
+    // pHYs Chunk
+    if meta.has_phys {
+        println!("  Physical pixel dimensions (pHYs):");
+        let unit_str = if meta.phys_unit == 1 { "pixels/meter" } else { "unknown" };
+        println!(
+            "   Resolution: {} x {} {}",
+            meta.phys_x, meta.phys_y, unit_str
+        );
+        if meta.phys_unit == 1 && meta.phys_x > 0 && meta.phys_y > 0 {
+            // Assumes 'width' and 'height' are available in the current scope
+            let width_cm = (width as f64 / meta.phys_x as f64) * 100.0;
+            let height_cm = (height as f64 / meta.phys_y as f64) * 100.0;
+            println!("   Size: {:.3} cm x {:.3} cm", width_cm, height_cm);
+        }
+        if meta.phys_y > 0 {
+            let aspect = meta.phys_x as f64 / meta.phys_y as f64;
+            println!("   Aspect ratio: {:.6}", aspect);
+        }
     }
 
     // hIST Chunk (Large block rule: Only print length)
@@ -252,7 +272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     unsafe {
         let dec = &*handle;
-        print_metadata_to_console(&dec.meta);
+        print_metadata_to_console(&dec.meta, width, height);
     }
 
     let num_scanlines = if let Some(s) = args.scanlines {

@@ -334,6 +334,20 @@ impl PngDecoder {
                         meta.has_srgb = true;
                     }
                 }
+                b"cHRM" => {
+                    if len == 32 {
+                        for i in 0..8 {
+                            let start = i * 4;
+                            let end = start + 4;
+                            meta.chrm_data[i] = u32::from_be_bytes(
+                                payload[start..end]
+                                .try_into()
+                                .map_err(|_| "Malformed cHRM coordinate data".to_string())?
+                            );
+                        }
+                        meta.has_chrm = true;
+                    }
+                }
                 b"tIME" => {
                     if len == 7 {
                         let year = u16::from_be_bytes(payload[0..2].try_into().map_err(|_| "Malformed tIME year sequence".to_string())?);
