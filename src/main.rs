@@ -39,7 +39,7 @@ fn write_rgb_8bit<W: Write>(writer: &mut W, raw_data: &[u8], color_type: u8) {
             }
             writer.write_all(&rgb).unwrap();
         }
-        2 => { // RGB -> RGB (Direct write)
+        2 | 3 => { // RGB -> RGB (Direct write)
             writer.write_all(raw_data).unwrap();
         }
         4 => { // Grayscale + Alpha -> RGB (Ignore Alpha)
@@ -118,9 +118,10 @@ fn main() {
     let mut height = 0;
     let mut bit_depth = 0;
     let mut color_type = 0;
+    let mut bytes_per_scanline = 0;
 
     let handle = if args.input == "-" {
-        unsafe {
+        {
             open_png_stream(
                 stdin_read_cb,
                 std::ptr::null_mut(),
@@ -128,17 +129,19 @@ fn main() {
                             &mut height,
                             &mut bit_depth,
                             &mut color_type,
+                            &mut bytes_per_scanline,
             )
         }
     } else {
         let c_input = CString::new(args.input).unwrap();
-        unsafe {
+        {
             open_png(
                 c_input.as_ptr(),
                      &mut width,
                      &mut height,
                      &mut bit_depth,
                      &mut color_type,
+                     &mut bytes_per_scanline,
             )
         }
     };
@@ -148,10 +151,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!(
-        "PNG Opened: {}x{} ({} bit, color type {})",
-             width, height, bit_depth, color_type
-    );
+
 
     let channels = match color_type {
         0 => 1,
@@ -161,8 +161,11 @@ fn main() {
         6 => 4,
         _ => 1,
     };
-    let bits_per_pixel = channels * bit_depth as usize;
-    let bytes_per_scanline = (width as usize * bits_per_pixel + 7) / 8;
+
+    println!(
+        "PNG Opened: {} x {} / {} bits per channel / color type {} / {} color channels",
+             width, height, bit_depth, color_type, channels
+    );
 
     let num_scanlines = if let Some(s) = args.scanlines {
         s
@@ -174,7 +177,7 @@ fn main() {
         10
     };
 
-    println!("Streaming in batches of {} scanline(s)", num_scanlines);
+    println!("Streaming in batches of {} scanline(s), output stride is {}", num_scanlines, bytes_per_scanline);
 
     let mut out_file = BufWriter::new(File::create(&args.output).expect("Failed to create output"));
 
@@ -184,8 +187,9 @@ fn main() {
     let mut total_decoded = 0;
 
     loop {
-        let result = unsafe { decode_scanlines(handle, num_scanlines) };
+        let result = decode_scanlines(handle, num_scanlines);
         if result.size == 0 || result.data.is_null() {
+            println!("Decoder returned no data! Aborting...");
             break;
         }
 
@@ -204,9 +208,9 @@ fn main() {
         std::io::Write::flush(&mut std::io::stdout()).unwrap();
     }
 
-    println!("\nSuccess!");
-
-    unsafe {
-        close_png(handle);
+    if total_decoded > 0 {
+        println!("\nSuccess!");
     }
+
+    close_png(handle);
 }
