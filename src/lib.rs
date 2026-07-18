@@ -28,7 +28,6 @@ pub struct PngDecoder {
 
     palette: Vec<[u8; 3]>,
     transparency: Vec<u8>,
-    expanded_buffer: Vec<u8>, // Stores the RGB/RGBA result for Type 3
 }
 
 #[repr(C)]
@@ -140,29 +139,46 @@ fn unfilter_scanline_inplace(
     }
 }
 
-fn expand_indexed(
+fn expand_indexed_inplace(
     palette: &[[u8; 3]],
     transparency: &[u8],
     bit_depth: u8,
-    src: &[u8],
-    dest: &mut Vec<u8>
+    buffer: &mut [u8],
+    num_rows: usize,
+    packed_row_stride: usize,
+    expanded_row_stride: usize,
 ) {
     let pixels_per_byte = 8 / bit_depth as usize;
-    let mask = (1usize << bit_depth) - 1;
+    let mask = (1usize << bit_depth as usize) - 1;
+    let pixel_stride = if !transparency.is_empty() { 4 } else { 3 };
 
-    dest.clear();
+    let ptr = buffer.as_mut_ptr();
 
-    for &byte in src {
-        for i in (0..pixels_per_byte).rev() {
-            let shift = i * bit_depth as usize;
-            let idx = (byte as usize >> shift) & mask;
-            if let Some(color) = palette.get(idx) {
-                dest.extend_from_slice(color);
-                // Add alpha if exists
-                if let Some(&alpha) = transparency.get(idx) {
-                    dest.push(alpha);
-                } else if !transparency.is_empty() {
-                    dest.push(255);
+    for row in (0..num_rows).rev() {
+        let src_row_start = row * packed_row_stride;
+        let dst_row_start = row * expanded_row_stride;
+
+        // Start write pointer at the very end of the current expanded scanline
+        let mut write_idx = dst_row_start + expanded_row_stride;
+
+        for i in (0..packed_row_stride).rev() {
+            let byte = unsafe { *ptr.add(src_row_start + i) };
+
+            for p in (0..pixels_per_byte).rev() {
+                let shift = p * bit_depth as usize;
+                let idx = (byte as usize >> shift) & mask;
+
+                // Unconditionally move write pointer back by the stride
+                write_idx -= pixel_stride;
+
+                let color = palette.get(idx).unwrap_or(&[0, 0, 0]);
+                unsafe {
+                    *ptr.add(write_idx) = color[0];
+                    *ptr.add(write_idx + 1) = color[1];
+                    *ptr.add(write_idx + 2) = color[2];
+                    if pixel_stride == 4 {
+                        *ptr.add(write_idx + 3) = *transparency.get(idx).unwrap_or(&255);
+                    }
                 }
             }
         }
@@ -268,7 +284,6 @@ impl PngDecoder {
             pending_drain: 0,
             palette: palette,
             transparency: transparency,
-            expanded_buffer: Vec::new(),
         })
     }
 
@@ -448,29 +463,41 @@ pub extern "C" fn decode_scanlines(
 
     dec.pending_drain = lines_to_process * bytes_needed_per_line;
     dec.current_y += lines_to_process as u32;
-    if dec.color_type == 3 { //Expand indexed palette
-        // Create a clean buffer for expansion without filter bytes
-        let mut packed_pixels = Vec::with_capacity(lines_to_process * dec.bytes_per_scanline);
+    if dec.color_type == 3 {
+        let packed_size_with_filters = lines_to_process * bytes_needed_per_line;
+        let expanded_size = lines_to_process * dec.output_stride;
 
-        // Extract only the pixel data (skipping the filter byte)
-        for i in 0..lines_to_process {
-            let start = i * dec.bytes_per_scanline; // dest_start in unfilter logic
-            let end = start + dec.bytes_per_scanline;
-            packed_pixels.extend_from_slice(&dec.uncompressed_buffer[start..end]);
+        let original_len = dec.uncompressed_buffer.len();
+        let remainder_size = original_len - packed_size_with_filters;
+
+        // Resize single buffer to hold the expanded pixels PLUS the zlib remainder
+        dec.uncompressed_buffer.resize(expanded_size + remainder_size, 0);
+
+        // Shift the untouched zlib stream data safely out of the way
+        if remainder_size > 0 {
+            dec.uncompressed_buffer.copy_within(
+                packed_size_with_filters..original_len,
+                expanded_size
+            );
         }
 
-        // Expand using the cleaned pixel data
-        expand_indexed(
+        // Expand the compactly packed unfiltered pixels strictly in-place
+        expand_indexed_inplace(
             &dec.palette,
             &dec.transparency,
             dec.bit_depth,
-            &packed_pixels, // Pass the clean, packed pixels
-            &mut dec.expanded_buffer,
+            &mut dec.uncompressed_buffer[..expanded_size],
+            lines_to_process,
+            dec.bytes_per_scanline,
+            dec.output_stride,
         );
 
+        // Set the drain window to match the expanded output footprint
+        dec.pending_drain = expanded_size;
+
         ScanlinesResult {
-            data: dec.expanded_buffer.as_ptr(),
-            size: lines_to_process * dec.output_stride,
+            data: dec.uncompressed_buffer.as_ptr(),
+            size: expanded_size,
         }
     } else {
         ScanlinesResult {

@@ -189,7 +189,6 @@ fn main() {
     loop {
         let result = decode_scanlines(handle, num_scanlines);
         if result.size == 0 || result.data.is_null() {
-            println!("Decoder returned no data! Aborting...");
             break;
         }
 
