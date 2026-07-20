@@ -43,7 +43,7 @@ unsafe extern "C" fn stdin_read_cb(_user_data: *mut std::ffi::c_void, buf: *mut 
 
 unsafe extern "C" {
     fn get_last_error() -> *const std::os::raw::c_char;
-    fn free_error_string(ptr: *mut std::os::raw::c_char);
+    fn free_error_string_dec(ptr: *mut std::os::raw::c_char);
 }
 
 /// Prints auxiliary chunk components to the console, automatically formatting
@@ -248,7 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !err_ptr.is_null() {
                 let c_str = std::ffi::CStr::from_ptr(err_ptr);
                 eprintln!("{}", format!("Error: {}", c_str.to_string_lossy()).bright_red());
-                free_error_string(err_ptr as *mut _);
+                free_error_string_dec(err_ptr as *mut _);
             } else {
                 eprintln!("Error: Could not open or parse PNG file.");
             }
