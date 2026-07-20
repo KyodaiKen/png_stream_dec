@@ -722,7 +722,7 @@ pub extern "C" fn close_png(handle: *mut PngDecoder) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_last_error() -> *const c_char {
+pub extern "C" fn get_last_error_dec() -> *const c_char {
     LAST_ERROR.with(|e| {
         let err = e.borrow();
         // Strip out internal null bytes so initializing CString is structurally guaranteed to pass

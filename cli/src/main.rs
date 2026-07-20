@@ -42,7 +42,7 @@ unsafe extern "C" fn stdin_read_cb(_user_data: *mut std::ffi::c_void, buf: *mut 
 }
 
 unsafe extern "C" {
-    fn get_last_error() -> *const std::os::raw::c_char;
+    fn get_last_error_dec_dec() -> *const std::os::raw::c_char;
     fn free_error_string_dec(ptr: *mut std::os::raw::c_char);
 }
 
@@ -244,7 +244,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if handle.is_null() {
         unsafe {
-            let err_ptr = get_last_error();
+            let err_ptr = get_last_error_dec();
             if !err_ptr.is_null() {
                 let c_str = std::ffi::CStr::from_ptr(err_ptr);
                 eprintln!("{}", format!("Error: {}", c_str.to_string_lossy()).bright_red());
