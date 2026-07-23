@@ -42,7 +42,7 @@ unsafe extern "C" fn stdin_read_cb(_user_data: *mut std::ffi::c_void, buf: *mut 
 }
 
 unsafe extern "C" {
-    fn get_last_error_dec_dec() -> *const std::os::raw::c_char;
+    fn get_last_error_dec() -> *const std::os::raw::c_char;
     fn free_error_string_dec(ptr: *mut std::os::raw::c_char);
 }
 
