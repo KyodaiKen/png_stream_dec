@@ -42,6 +42,9 @@ pub struct PngDecoder {
     idat_crc: flate2::Crc,
     idat_corrupted: bool,
 
+    pub count_idat_size: bool,
+    pub total_idat_size: usize,
+
     pub meta: AuxiliaryMetadata,
 }
 
@@ -424,6 +427,8 @@ impl PngDecoder {
            transparency,
            idat_crc,
            idat_corrupted: false,
+           count_idat_size: false,
+           total_idat_size: 0,
            meta,
         })
     }
@@ -570,6 +575,9 @@ pub extern "C" fn decode_scanlines(
                             break;
                         } else if ctype == *b"IDAT" {
                             dec.idat_remaining = len;
+                            if dec.count_idat_size {
+                                dec.total_idat_size += len;
+                            }
                             dec.idat_crc = flate2::Crc::new();
                             dec.idat_crc.update(b"IDAT");
                             break;
@@ -803,4 +811,30 @@ pub extern "C" fn png_get_text_data(
     } else {
         false
     }
+}
+
+/// Enable or disable IDAT payload counting. If enabled, accounts for initial and subsequent IDAT chunks.
+#[unsafe(no_mangle)]
+pub extern "C" fn png_set_count_idat_size(handle: *mut PngDecoder, enable: bool) {
+    if handle.is_null() {
+        return;
+    }
+    let dec = unsafe { &mut *handle };
+    if enable && !dec.count_idat_size {
+        dec.count_idat_size = true;
+        // Account for the first IDAT chunk payload already parsed during PngDecoder::new
+        dec.total_idat_size += dec.idat_remaining;
+    } else if !enable {
+        dec.count_idat_size = false;
+    }
+}
+
+/// Returns total raw IDAT data size (payload bytes without headers/CRCs).
+#[unsafe(no_mangle)]
+pub extern "C" fn png_get_idat_size(handle: *mut PngDecoder) -> usize {
+    if handle.is_null() {
+        return 0;
+    }
+    let dec = unsafe { &*handle };
+    dec.total_idat_size
 }
